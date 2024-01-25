@@ -5,11 +5,8 @@ import stanza
 from stanza import func
 
 a, b = (lambda x: x), (lambda y: y + 1)
-print(stanza.parse(a))
-print(stanza.parse(b))
-
-f_ast = stanza.parse(f)
-print(f_ast)
+a = stanza.func(a)
+b = stanza.func(b)
 # # Also works on lambdas!
 # f_func = stanza.func(f)
 

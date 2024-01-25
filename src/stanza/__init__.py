@@ -1,14 +1,23 @@
 from stanza import _stanza
+from stanza._stanza import (
+    Function, Ast
+)
+
 import dill.source as source
 import ast
+import types
 
 def parse(f):
+    if not isinstance(f, types.FunctionType):
+        raise TypeError("Expected function, got {}".format(type(f)))
     # TODO: handle callables that aren't functions or lambdas
     src = source.getsource(f)
     path = source.getsourcefile(f)
     lineno = source.getsourcelines(f)[1]
     # To handle lambdas, do some fancy stuff
     # to get the OG lambda's source code
+    # This involves analyzing the line where the lambda is defined,
+    # compiling all the lambdas in the line, and comparing the bytecode
     if f.__name__ == "<lambda>":
         source_ast = ast.parse(src, path, type_comments=True)
         lambdas = [node for node in ast.walk(source_ast)
@@ -30,7 +39,11 @@ def parse(f):
     else:
         return _stanza.parse(src, path, lineno)
 
-def func(f):
+def jit(f):
+    if isinstance(f, Function):
+        return f
+    if not isinstance(f, types.FunctionType):
+        raise TypeError("Expected function, got {}".format(type(f)))
     ast = parse(f)
     expr = _stanza.transpile(ast)
-    function = _stanza.Function(expr, f.__globals__)
+    return _stanza.Function(expr, f.__closure__)
