@@ -40,6 +40,20 @@ class OptimizerConfig:
             schedule_builder = lambda s: optax.linear_schedule(self.lr, 0., s)
         elif self.lr_schedule == "cosine":
             schedule_builder = lambda s: optax.cosine_decay_schedule(self.lr, s)
+        elif self.lr_schedule == "exponential":
+            schedule_builder = lambda s: optax.exponential_decay(
+                init_value=self.lr, 
+                transition_steps=s/10,
+                staircase=False,
+                decay_rate=0.8, 
+                end_value=0.001*self.lr)
+        elif self.lr_schedule == "exponential_staircase":
+            schedule_builder = lambda s: optax.exponential_decay(
+                init_value=self.lr, 
+                transition_steps=s/10,
+                staircase=True,
+                decay_rate=0.8, 
+                end_value=0.001*self.lr)
         else:
             raise ValueError(f"Unknown learning rate schedule: {self.lr_schedule}")
 
@@ -99,14 +113,72 @@ class SGDConfig(OptimizerConfig):
     weight_decay: float | None = None
 
     def make_optimizer(self, iterations):
-        optim = optax.sgd(learning_rate=self.make_lr_schedule(iterations),
+        sgd = optax.sgd(learning_rate=self.make_lr_schedule(iterations),
                          momentum=self.momentum, nesterov=self.nesterov)
         if self.weight_decay:
-            optim = optax.chain(optax.add_decayed_weights(self.weight_decay), optim)
-        return optim
+            sgd = optax.chain(optax.add_decayed_weights(self.weight_decay), sgd)
+        return sgd
 
     def parse(self, config: ConfigProvider) -> "SGDConfig":
         return config.get_struct(self)
+
+from optax._src import base
+from optax._src.transform import ScaleByScheduleState, numerics
+
+def combine(
+    *args: base.GradientTransformation,
+) -> base.GradientTransformationExtraArgs:
+    transforms = [base.with_extra_args_support(t) for t in args]
+    init_fns, update_fns = zip(*transforms)
+    def init_fn(params):
+        return tuple(fn(params) for fn in init_fns)
+    def update_fn(updates, state, params=None, **extra_args):
+        if len(update_fns) != len(state):
+            raise ValueError('The number of updates and states has to be the same in '
+                           'chain! Make sure you have called init first!')
+        new_state = []
+        new_updates = []
+        for s, fn in zip(state, update_fns):
+            updates_out, new_s = fn(updates, s, params, **extra_args)
+            new_updates.append(updates_out)
+            new_state.append(new_s)
+        return tuple(new_updates), tuple(new_state)
+    return base.GradientTransformationExtraArgs(init_fn, update_fn)
+
+def update_by_schedule(
+    iter_update_fn: base.Schedule
+) -> base.GradientTransformation:
+    def init_fn(params):
+        del params
+        return ScaleByScheduleState(count=jnp.zeros([], jnp.int32))
+
+    def update_fn(updates, state, params=None):
+        del params
+        updates = iter_update_fn(state.count, updates)
+        return updates, ScaleByScheduleState(
+            count=numerics.safe_int32_increment(state.count))
+    return base.GradientTransformation(init_fn, update_fn)
+
+
+
+@struct.dataclass
+class CombineConfig:
+    optimizer_a: OptimizerConfig
+    optimizer_b: OptimizerConfig
+    switch_percent: float
+
+    def make_optimizer(self, iterations):
+        switch_iteration = int(iterations*self.switch_percent)
+        combined = combine(
+            self.optimizer_a.make_optimizer(iterations),
+            self.optimizer_b.make_optimizer(iterations)
+        )
+        switch = update_by_schedule(
+            lambda i, updates: jax.lax.cond(i < switch_iteration, 
+            lambda: updates[0], lambda: updates[1])
+        )
+        opt = optax.chain(combined, switch)
+        return opt
 
 @struct.dataclass
 class SAMConfig:
@@ -128,12 +200,12 @@ class SAMConfig:
         backward_opt = optax.chain(sam.normalize(), backward_opt) if self.normalize else backward_opt
         if self.start_percent > 0 or self.run_percent < 1.:
             start_iter = int(self.start_percent * iterations)
-            end_iter = int((iterations - start_iter)*self.run_percent)
+            end_iter = int((iterations - start_iter)*self.run_percent) + start_iter
             backward_opt = optax.chain(
                 backward_opt,
                 optax.scale_by_schedule(
                     lambda i: jax.lax.cond(
-                        jnp.logical_and(i < start_iter, i > end_iter), 
+                        jnp.logical_or(i < start_iter, i > end_iter), 
                     lambda: 0, lambda: 1))
             )
         return sam.sam(

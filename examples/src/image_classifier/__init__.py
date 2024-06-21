@@ -13,7 +13,7 @@ from stanza.random import PRNGSequence
 from stanza.datasets import image_class_datasets
 
 from functools import partial
-from common import TrainConfig, AdamConfig, SAMConfig, SGDConfig
+from common import TrainConfig, AdamConfig, SAMConfig, SGDConfig, CombineConfig
 
 import net
 
@@ -39,12 +39,12 @@ class Config:
     model: str = "SmallResNet18"
 
     lr: float | None = None
-    lr_schedule: str = "cosine"
+    lr_schedule: str = "exponential_staircase"
     cycles: int = 1 # cycles of the lr schedule to play
     cycle_mult : float = 2.
     epochs: int = 50
     batch_size: int = 128
-    optimizer: str = "adam"
+    optimizer: str = "adam_sgd_0.5"
 
     # sam-related parameters
     sam_rho: float = 0. # None if SAM is disabled
@@ -66,19 +66,34 @@ def train(config: Config):
     logger.info(f"Training {config}")
     rng = PRNGSequence(config.seed)
 
+    adam_optimizer = AdamConfig(config.lr or 5e-3,
+        config.lr_schedule,
+        cycles=config.cycles,
+        cycle_mult=config.cycle_mult,
+        weight_decay=1e-5
+    )
+    sgd_optimizer = SGDConfig(config.lr or 2e-1,
+        config.lr_schedule, weight_decay=1e-4,
+        cycles=config.cycles,
+        cycle_mult=config.cycle_mult
+    )
     if config.optimizer == "adam":
-        optimizer = AdamConfig(config.lr or 5e-3,
-            config.lr_schedule,
-            cycles=config.cycles,
-            cycle_mult=config.cycle_mult,
-            weight_decay=1e-5
-        )
+        optimizer = adam_optimizer
     elif config.optimizer == "sgd":
-        optimizer = SGDConfig(config.lr or 2e-1,
-            config.lr_schedule, weight_decay=1e-4,
-            cycles=config.cycles,
-            cycle_mult=config.cycle_mult
+        optimizer = sgd_optimizer
+    elif config.optimizer == "adam_sgd_0.5":
+        optimizer = CombineConfig(
+            adam_optimizer,
+            sgd_optimizer,
+            0.5
         )
+    elif config.optimizer == "adam_sgd_0.9":
+        optimizer = CombineConfig(
+            adam_optimizer,
+            sgd_optimizer,
+            0.9
+        )
+
     wandb_run = wandb.init(
         project="image_classifier",
         config=stanza.util.flatten_to_dict(config)[0]
